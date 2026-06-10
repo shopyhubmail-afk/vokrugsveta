@@ -185,7 +185,10 @@ function applyAction(room, seat, action) {
 
     case 'buy': {
       if (st.phase !== 'buy' || myIdx !== st.current) return null;
+      const buyCell = VS.CELLS[st.landed];
       st = E.buyProperty(st, myIdx, st.landed);
+      // перезаписываем тост чтобы всегда показывалось имя покупателя
+      st = { ...st, toast: `${st.players[myIdx].name} купил ${buyCell?.name || ''}` };
       st = doEndTurn(st);
       return st;
     }
