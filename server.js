@@ -66,7 +66,9 @@ function broadcast(room, msg) {
      seats: [{ ws, id:'p0'..'p3', name, seatIdx }]
    }
 */
-const rooms = new Map(); // code → room
+const rooms  = new Map(); // code → room
+const wsRoom = new WeakMap(); // ws → room
+const wsSeat = new WeakMap(); // ws → seat
 
 /* ═══════════ Матчмейкинг ═══════════
    matchmakingQueues: Map<playerCount, [{ws, name}]>
@@ -115,6 +117,8 @@ function handleMatchmaking(ws, name, playerCount) {
     rooms.set(code, room);
 
     seats.forEach((seat, i) => {
+      wsRoom.set(seat.ws, room);
+      wsSeat.set(seat.ws, seat);
       send(seat.ws, { type: 'matched', code, myIdx: i, myId: 'p' + i, state: st });
     });
     console.log(`[match] room ${code} — ${count} players: ${entries.map(e => e.name).join(', ')}`);
@@ -211,6 +215,7 @@ function applyAction(room, seat, action) {
 
     case 'endTurn': {
       if (myIdx !== st.current) return null;
+      if (st.phase === 'rent' || st.phase === 'buy' || st.phase === 'auction') return null;
       st = doEndTurn(st);
       return st;
     }
@@ -280,6 +285,18 @@ function applyAction(room, seat, action) {
       return next.phase !== 'auction' ? doEndTurn(next) : next;
     }
 
+    case 'proposeTrade': {
+      const { withId, give = [], get = [], money = 0 } = action;
+      const partnerIdx = st.players.findIndex(p => p.id === withId);
+      if (partnerIdx < 0 || partnerIdx === myIdx) return null;
+      // проверяем владельцев
+      if (give.some(i => st.owners[i] !== seat.id)) return null;
+      if (get.some(i => st.owners[i] !== withId)) return null;
+      // нельзя менять заложенные или застроенные
+      if ([...give, ...get].some(i => st.mortgaged[i] || (st.houses[i] || 0) > 0)) return null;
+      return E.applyTrade(st, myIdx, partnerIdx, give, get, money);
+    }
+
     default:
       // Поддержка action.kind для аукциона (клиент шлёт { kind:'bid', amount })
       if (action.kind === 'bid') {
@@ -347,15 +364,15 @@ function resolveMove(st, pIdx, steps) {
 
 /* doEndTurn — следующий ход */
 function doEndTurn(st) {
-  if (st.winner) return { ...st, phase: 'over' };
+  if (st.winner) return { ...st, phase: 'over', card: null };
   if (st.lastDouble && !st.players[st.current].inJail) {
-    return { ...st, phase: 'idle', landed: null, rentDue: 0, lastDouble: false };
+    return { ...st, phase: 'idle', landed: null, rentDue: 0, lastDouble: false, card: null };
   }
   const next = E.nextActiveIdx(st, st.current);
   return {
     ...E.recordHistory(st),
     current: next, phase: 'idle', landed: null, rentDue: 0,
-    doubleCount: 0, lastDouble: false,
+    doubleCount: 0, lastDouble: false, card: null,
     hint: `${st.players[next].name} ходит…`,
   };
 }
@@ -455,6 +472,7 @@ wss.on('connection', (ws) => {
 
     /* ── игровое действие ── */
     if (msg.type === 'action') {
+      if (!myRoom) { myRoom = wsRoom.get(ws) || null; mySeat = wsSeat.get(ws) || null; }
       if (!myRoom || !mySeat || !myRoom.state) return;
       const newState = applyAction(myRoom, mySeat, msg.action);
       if (!newState) { send(ws, { type:'error', msg:'недопустимое действие' }); return; }
@@ -466,6 +484,7 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     removeFromMatchmaking(ws); // убираем из очереди, если был в ней
+    if (!myRoom) { myRoom = wsRoom.get(ws) || null; mySeat = wsSeat.get(ws) || null; }
     if (!myRoom || !mySeat) return;
     myRoom.seats = myRoom.seats.filter(s => s !== mySeat);
     if (myRoom.seats.length === 0) {
