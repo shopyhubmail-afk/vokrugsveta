@@ -35,7 +35,10 @@ const path  = require('path');
    engine.js и board-data.js используют window.VS / window.VSEngine.
    Подставляем global как window, eval-им файлы. */
 global.window = global;
-const BASE = path.join(__dirname, '..', 'vokrug-sveta');
+// Ищем движок: сначала рядом (Railway, всё в корне), потом ../vokrug-sveta/ (локально)
+const BASE = fs.existsSync(path.join(__dirname, 'board-data.js'))
+  ? __dirname
+  : path.join(__dirname, '..', 'vokrug-sveta');
 eval(fs.readFileSync(path.join(BASE, 'board-data.js'), 'utf8'));   // → global.VS
 eval(fs.readFileSync(path.join(BASE, 'engine.js'),     'utf8'));   // → global.VSEngine
 const E  = global.VSEngine;
