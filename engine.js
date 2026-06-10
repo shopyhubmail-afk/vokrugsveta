@@ -79,7 +79,7 @@
       hint: 'Брось кубики, чтобы начать',
       fly: null, toast: null, card: null,
       winner: null, trade: null, auction: null,
-      logs: [],
+      logs: [], turnNum: 0,
       history: [players.map(() => START_BALANCE)],
       bank: { houses: 32, hotels: 12 },
     };
@@ -214,23 +214,37 @@
     return -1; // больше некому
   }
 
+  /* ══════════════ СТИЛИ ИГРОКОВ ══════════════ */
+  const STYLES = {
+    buyer:    { cashBuffer: 60,  buyProb: 0.95, ceilMult: 1.25, buildBuffer: 200, maxHouses: 3 },
+    builder:  { cashBuffer: 100, buyProb: 0.85, ceilMult: 1.10, buildBuffer: 120, maxHouses: 5 },
+    careful:  { cashBuffer: 300, buyProb: 0.65, ceilMult: 0.95, buildBuffer: 400, maxHouses: 2 },
+    balanced: { cashBuffer: 150, buyProb: 0.85, ceilMult: 1.10, buildBuffer: 250, maxHouses: 3 },
+  };
+
+  function getStyle(player) {
+    return STYLES[player.id] || STYLES.balanced;
+  }
+
   /* ══════════════ РЕШЕНИЯ ИИ ══════════════ */
   function botWantsToBuy(state, pIdx, cellIdx, rng) {
     const r = rng || Math.random;
     const pl = state.players[pIdx];
     const cell = VS.CELLS[cellIdx];
-    if (pl.balance < cell.price + 120) return false;
-    let score = 0.55;
+    const style = getStyle(pl);
+    const afford = (pl.balance - cell.price) >= style.cashBuffer;
+    if (!afford) return false;
     if (cell.type === 'prop') {
       const have = ownedInRegion(state, cell.region, pl.id);
-      score += have * 0.22;
       const total = VS.CELLS.filter(c => c.region === cell.region && c.type === 'prop').length;
-      if (have === total - 1) score += 0.25;
-    } else {
-      score += 0.15;
+      if (have >= total - 1) return true; // completes or expands monopoly
+      if (have >= 1) return true;
+    } else if (cell.type === 'air') {
+      if (countAirports(state, pl.id) >= 1) return true;
+    } else if (cell.type === 'util') {
+      if (countUtils(state, pl.id) >= 1) return true;
     }
-    if (pl.balance > cell.price * 4) score += 0.15;
-    return r() < Math.min(0.95, score);
+    return r() < style.buyProb;
   }
 
   function tradeValueFor(gainCells, loseCells, moneyDelta) {
@@ -240,44 +254,121 @@
     return g - l + moneyDelta;
   }
 
-  function partnerAcceptsTrade(state, trade) {
-    const net = tradeValueFor(trade.give, trade.get, trade.money);
-    return net >= -20;
+  function propValueFor(state, cellIdx, playerId) {
+    const cell = VS.CELLS[cellIdx];
+    if (!cell) return 0;
+    const base = cell.price || 0;
+    if (cell.type === 'prop') {
+      const total = VS.CELLS.filter(c => c.region === cell.region && c.type === 'prop').length;
+      const owned = ownedInRegion(state, cell.region, playerId);
+      let multiplier = 1.0;
+      if (owned >= total - 1) multiplier = 2.0;
+      else if (owned >= 1) multiplier = 1.3;
+      return Math.round(base * multiplier);
+    }
+    if (cell.type === 'air') {
+      const ownedCount = countAirports(state, playerId);
+      const bonus = ownedCount * 0.2 * base;
+      return Math.round(base + bonus);
+    }
+    if (cell.type === 'util') {
+      const ownedCount = countUtils(state, playerId);
+      const bonus = ownedCount * 0.2 * base;
+      return Math.round(base + bonus);
+    }
+    return base;
+  }
+
+  // partnerAcceptsTrade: checks from PARTNER's perspective
+  // give = what meIdx gives (partner receives), get = what meIdx gets (partner gives away)
+  function partnerAcceptsTrade(state, trade, meIdx, partnerIdx) {
+    // Support old 2-arg call signature (backwards compat for human trade in game-full.jsx)
+    if (meIdx === undefined || partnerIdx === undefined) {
+      const net = tradeValueFor(trade.give, trade.get, trade.money);
+      return net >= -20;
+    }
+    const partnerId = state.players[partnerIdx].id;
+    // Partner receives: trade.give cells (valued for partner)
+    const receiveValue = trade.give.reduce((s, i) => s + propValueFor(state, i, partnerId), 0);
+    // Partner gives away: trade.get cells (valued for partner — lost value)
+    const giveAwayValue = trade.get.reduce((s, i) => s + propValueFor(state, i, partnerId), 0);
+    // money: positive means meIdx pays partner
+    const net = receiveValue + trade.money - giveAwayValue;
+    return net >= 0;
+  }
+
+  function botProposeTrade(state, pIdx, rng) {
+    const r = rng || Math.random;
+    const style = getStyle(state.players[pIdx]);
+    const myId = state.players[pIdx].id;
+    const myBalance = state.players[pIdx].balance;
+
+    // Find a region where pIdx owns (groupSize - 1) and missing 1 belongs to another player
+    const regions = Object.keys(VS.REGIONS);
+    for (const region of regions) {
+      const regionCells = VS.CELLS.filter(c => c.region === region && c.type === 'prop');
+      const groupSize = regionCells.length;
+      if (groupSize < 2) continue;
+      const owned = regionCells.filter(c => state.owners[c.i] === myId);
+      if (owned.length !== groupSize - 1) continue;
+      const missing = regionCells.find(c => state.owners[c.i] !== myId);
+      if (!missing) continue;
+      const missingOwner = state.owners[missing.i];
+      if (!missingOwner) continue; // unowned
+      const partnerIdx = state.players.findIndex(p => p.id === missingOwner);
+      if (partnerIdx < 0 || state.players[partnerIdx].bankrupt) continue;
+      if (state.mortgaged[missing.i]) continue;
+      if ((state.houses[missing.i] || 0) > 0) continue;
+
+      // Find a give cell: one extra city of pIdx not in a near-monopoly group
+      let giveCell = null;
+      const myProps = Object.keys(state.owners)
+        .filter(idx => state.owners[idx] === myId)
+        .map(idx => Number(idx))
+        .filter(idx => {
+          const c = VS.CELLS[idx];
+          if (!c || c.type !== 'prop') return false;
+          if ((state.houses[idx] || 0) > 0) return false;
+          if (state.mortgaged[idx]) return false;
+          // Not in a near-monopoly group (i.e. don't give away a cell we almost monopolize)
+          const grpCells = VS.CELLS.filter(cc => cc.region === c.region && cc.type === 'prop');
+          const ownedInGrp = grpCells.filter(cc => state.owners[cc.i] === myId).length;
+          return ownedInGrp < grpCells.length - 1;
+        });
+      if (myProps.length > 0) giveCell = myProps[0];
+
+      const give = giveCell !== null ? [giveCell] : [];
+      const rawMoney = Math.round(missing.price * 1.5);
+      const money = Math.min(rawMoney, myBalance - style.cashBuffer);
+      if (money < 0) continue;
+
+      const trade = { meIdx: pIdx, partnerIdx, give, get: [missing.i], money };
+      if (partnerAcceptsTrade(state, trade, pIdx, partnerIdx)) {
+        return trade;
+      }
+    }
+    return null;
   }
 
   /**
    * botAuctionBid(state, pIdx, cellIdx, rng) → { bid: number } | { pass: true }
    */
   function botAuctionBid(state, pIdx, cellIdx, rng) {
-    const r = rng || Math.random;
     const pl = state.players[pIdx];
-    const cell = VS.CELLS[cellIdx];
+    const style = getStyle(pl);
     const highBid = state.auction ? state.auction.highBid : 0;
+    const auctionCellIdx = state.auction ? state.auction.cellIdx : (cellIdx || 0);
 
-    // Потолок желания (max willing to pay)
-    let ceiling = cell.price || 0;
-    if (cell.type === 'prop') {
-      const have = ownedInRegion(state, cell.region, pl.id);
-      const total = VS.CELLS.filter(c => c.region === cell.region && c.type === 'prop').length;
-      if (have === total - 1) ceiling = Math.round(cell.price * 1.2); // почти монополия
-      else if (have > 0)     ceiling = Math.round(cell.price * 1.1);
-    } else if (cell.type === 'air') {
-      const airs = countAirports(state, pl.id);
-      ceiling = cell.price + airs * 30;
-    } else if (cell.type === 'util') {
-      const utils = countUtils(state, pl.id);
-      ceiling = utils > 0 ? Math.round(cell.price * 1.1) : Math.round(cell.price * 0.85);
-    }
-    // Никогда не уходить в минус ниже порога
+    let ceiling = propValueFor(state, auctionCellIdx, pl.id) * style.ceilMult;
     ceiling = Math.min(ceiling, pl.balance - 50);
 
-    if (ceiling <= 0 || highBid >= ceiling) return { pass: true };
+    const cell = VS.CELLS[auctionCellIdx];
+    const step = Math.max(20, Math.round((cell && cell.price || 100) * 0.15));
 
-    const step = Math.max(10, Math.round((cell.price || 100) * 0.1));
-    const bid  = Math.min(ceiling, highBid + step);
+    if (highBid >= ceiling) return { pass: true };
+
+    const bid = Math.min(highBid + step, ceiling);
     if (bid <= highBid) return { pass: true };
-    // Лёгкая рандомизация: иногда пасуем даже при возможной ставке
-    if (r() < 0.12) return { pass: true };
     return { bid };
   }
 
@@ -291,6 +382,11 @@
     let s = adjustBalance(state, pIdx, amount);
     if (logType) s = withLog(s, { type: logType, player: pIdx, amount });
     return s;
+  }
+
+  // Возвращает true если игрок — человек ('you') и должен сам решать долговые проблемы
+  function needsManualDebt(state, pIdx) {
+    return state.players[pIdx] && state.players[pIdx].id === 'you';
   }
 
   // авто-залог/продажа домов для покрытия суммы need; возвращает state с максимальным балансом
@@ -315,7 +411,20 @@
   }
 
   // платёж (в банк, если toIdx == null). Авто-залог; при нехватке — банкротство.
+  // TODO: онлайн-режим (useOnlineGame / server.js) всегда использует авто-подъём средств;
+  //       ручное разрешение долга работает только в офлайн-игре с человеком.
   function payment(state, pIdx, amount, toIdx) {
+    // Если это человек и у него не хватает денег — переходим в фазу долга вместо авто-продажи
+    if (needsManualDebt(state, pIdx) && state.players[pIdx].balance < amount) {
+      const creditorId = toIdx != null ? state.players[toIdx].id : 'bank';
+      return {
+        ...state,
+        phase: 'debt',
+        debtOwed: amount,
+        debtCreditor: creditorId,
+        hint: `Нужно оплатить ${money(amount)}`,
+      };
+    }
     let s = autoRaiseFunds(state, pIdx, amount);
     const have = s.players[pIdx].balance;
     const broke = have < amount;
@@ -338,14 +447,25 @@
     const owners   = { ...state.owners };
     const houses   = { ...state.houses };
     const mortgaged = { ...state.mortgaged };
+    const bank = { ...(state.bank || { houses: 32, hotels: 12 }) };
     Object.keys(owners).forEach(idx => {
       if (owners[idx] !== loser.id) return;
+      // Return houses/hotels to bank before transferring/removing
+      const h = houses[idx] || 0;
+      if (h > 0) {
+        if (h >= 5) {
+          bank.hotels = Math.min(12, bank.hotels + 1);
+          bank.houses = Math.min(32, bank.houses + 4);
+        } else {
+          bank.houses = Math.min(32, bank.houses + h);
+        }
+      }
       if (toId) owners[idx] = toId; else delete owners[idx];
       delete houses[idx];
       if (!toId) delete mortgaged[idx];
     });
     let s = {
-      ...state, owners, houses, mortgaged,
+      ...state, owners, houses, mortgaged, bank,
       players: state.players.map((p, i) => i === pIdx ? { ...p, bankrupt: true, balance: 0 } : p),
       toast: `💀 ${loser.name} разорился`,
     };
@@ -386,7 +506,7 @@
       players: state.players.map((p, i) => i === pIdx ? { ...p, balance: p.balance - cell.price } : p),
       owners:  { ...state.owners, [cellIdx]: pl.id },
       hint:  `${pl.name} купил ${cell.name}`,
-      toast: `${cell.name} — твой!`,
+      toast: `${pl.name} купил ${cell.name}`,
     };
     return withLog(s, { type: 'buy', player: pIdx, property: cell.name, amount: cell.price });
   }
@@ -706,8 +826,9 @@
     isMonopoly, calcRent, houseCost, countHouses, countAirports, countUtils,
     ownedInRegion, liquidWorth, groupHouseCounts,
     canBuild, canSellHouse, nextActiveIdx, tradeValueFor,
-    botWantsToBuy, partnerAcceptsTrade, botAuctionBid,
+    getStyle, botWantsToBuy, propValueFor, partnerAcceptsTrade, botProposeTrade, botAuctionBid,
     // транзиции — собственность
+    needsManualDebt, autoRaiseFunds,
     gain, payment, bankrupt, checkWin,
     buyAt, buyProperty, buildHouse, sellHouse, mortgage, redeem,
     // транзиции — тюрьма, оплаты, карты, обмены
