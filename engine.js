@@ -27,7 +27,7 @@
     { id: 'c2',  text: 'Карантин закрыл границы — отправляйтесь в тюрьму',       jail: true },
     { id: 'c3',  text: 'Грант фонда путешествий: +200',                           money: 200 },
     { id: 'c4',  text: 'Туристический налог: −100',                               money: -100 },
-    { id: 'c5',  text: 'Землетрясение: ремонт по 40 за каждый дом',              houseTax: 40 },
+    { id: 'c5',  text: 'Землетрясение: ремонт 40 за дом, 115 за отель',          houseTax: 40, hotelTax: 115 },
     { id: 'c6',  text: 'Попутный ветер: +3 клетки вперёд',                       moveBy: 3 },
     { id: 'c7',  text: 'Задержка рейса: −2 клетки назад',                        moveBy: -2 },
     { id: 'c8',  text: 'Выгодный курс валют: банк платит вам 150',               money: 150 },
@@ -51,7 +51,7 @@
     { id: 'h6',  text: 'Возврат страховки: +60',                                  money: 60 },
     { id: 'h7',  text: 'Медицинская страховка: −50',                               money: -50 },
     { id: 'h8',  text: 'День рождения — каждый дарит вам 20',                     collectEach: 20 },
-    { id: 'h9',  text: 'Капитальный ремонт: по 30 за каждый дом',                houseTax: 30 },
+    { id: 'h9',  text: 'Капремонт: 30 за дом, 100 за отель',                     houseTax: 30, hotelTax: 100 },
     { id: 'h10', text: 'Кэшбэк за билеты: +40',                                   money: 40 },
     { id: 'h11', text: 'Проигрались в казино: −120',                               money: -120 },
     { id: 'h12', text: 'Дивиденды по акциям: +90',                                money: 90 },
@@ -145,6 +145,17 @@
       state.owners[idx] === id ? sum + h : sum, 0);
   }
 
+  // Дома и отели раздельно (для карт «ремонт»: отель ≠ 5 домов)
+  function countHousesHotels(state, pIdx) {
+    const id = state.players[pIdx].id;
+    let houses = 0, hotels = 0;
+    Object.entries(state.houses).forEach(([idx, h]) => {
+      if (state.owners[idx] !== id) return;
+      if (h >= 5) hotels += 1; else houses += h;
+    });
+    return { houses, hotels };
+  }
+
   function ownedInRegion(state, region, playerId) {
     return VS.CELLS.filter(c => c.region === region && c.type === 'prop' && state.owners[c.i] === playerId).length;
   }
@@ -216,10 +227,10 @@
 
   /* ══════════════ СТИЛИ ИГРОКОВ ══════════════ */
   const STYLES = {
-    buyer:    { cashBuffer: 60,  buyProb: 0.95, ceilMult: 1.25, buildBuffer: 200, maxHouses: 3 },
+    buyer:    { cashBuffer: 60,  buyProb: 0.95, ceilMult: 1.25, buildBuffer: 180, maxHouses: 5 },
     builder:  { cashBuffer: 100, buyProb: 0.85, ceilMult: 1.10, buildBuffer: 120, maxHouses: 5 },
-    careful:  { cashBuffer: 300, buyProb: 0.65, ceilMult: 0.95, buildBuffer: 400, maxHouses: 2 },
-    balanced: { cashBuffer: 150, buyProb: 0.85, ceilMult: 1.10, buildBuffer: 250, maxHouses: 3 },
+    careful:  { cashBuffer: 300, buyProb: 0.65, ceilMult: 0.95, buildBuffer: 350, maxHouses: 3 },
+    balanced: { cashBuffer: 150, buyProb: 0.85, ceilMult: 1.10, buildBuffer: 220, maxHouses: 5 },
   };
 
   function getStyle(player) {
@@ -399,7 +410,11 @@
       const withHouses = Object.keys(s.houses)
         .filter(idx => s.owners[idx] === id && (s.houses[idx] || 0) > 0 && canSellHouse(s, Number(idx), id))
         .sort((a, b) => (VS.CELLS[b].price || 0) - (VS.CELLS[a].price || 0));
-      if (withHouses.length) { s = sellHouse(s, Number(withHouses[0])); continue; }
+      if (withHouses.length) {
+        const next = sellHouse(s, Number(withHouses[0]));
+        if (next.players[pIdx].balance > s.players[pIdx].balance) { s = next; continue; }
+        // продажа не удалась (дефицит жилья) — переходим к залогу
+      }
       // Закладываем (только если в группе нет домов — проверка внутри mortgage)
       const mortgageable = Object.keys(s.owners)
         .filter(idx => s.owners[idx] === id && !s.mortgaged[idx] && !(s.houses[idx] > 0))
@@ -454,8 +469,8 @@
       const h = houses[idx] || 0;
       if (h > 0) {
         if (h >= 5) {
+          // отель возвращается как отель; его 4 дома вернулись в банк ещё при постройке
           bank.hotels = Math.min(12, bank.hotels + 1);
-          bank.houses = Math.min(32, bank.houses + 4);
         } else {
           bank.houses = Math.min(32, bank.houses + h);
         }
@@ -556,9 +571,11 @@
     const bank   = { ...(state.bank || { houses: 32, hotels: 12 }) };
 
     if (prevH === 5) {
-      // Отель → 4 дома: банк получает отель, отдаёт 4 дома
+      // Отель → 4 дома: банк получает отель, отдаёт 4 дома.
+      // Дефицит жилья (канон): нельзя разменять отель, если в банке нет 4 домов
+      if (bank.houses < 4) return { ...state, toast: 'В банке нет домов для размена отеля' };
       bank.hotels  = Math.min(12, bank.hotels + 1);
-      bank.houses  = Math.max(0,  bank.houses - 4);
+      bank.houses  = bank.houses - 4;
     } else {
       bank.houses = Math.min(32, bank.houses + 1);
     }
@@ -639,12 +656,20 @@
     if (typeof card.money === 'number' && card.money !== 0) {
       s = card.money > 0 ? gain(s, pIdx, card.money, 'card') : payment(s, pIdx, -card.money, null);
     }
-    if (card.houseTax) s = payment(s, pIdx, card.houseTax * countHouses(s, pIdx), null);
+    if (card.houseTax) {
+      const { houses, hotels } = countHousesHotels(s, pIdx);
+      const due = card.houseTax * houses + (card.hotelTax || card.houseTax) * hotels;
+      if (due > 0) s = payment(s, pIdx, due, null);
+    }
     if (card.collectEach) {
-      s.players.forEach((p, i) => { if (i !== pIdx && !p.bankrupt) s = payment(s, i, card.collectEach, pIdx); });
+      s.players.forEach((p, i) => {
+        if (i !== pIdx && !s.players[i].bankrupt) s = payment(s, i, card.collectEach, pIdx);
+      });
     }
     if (card.payEach) {
-      s.players.forEach((p, i) => { if (i !== pIdx && !p.bankrupt) s = payment(s, pIdx, card.payEach, i); });
+      s.players.forEach((p, i) => {
+        if (i !== pIdx && !s.players[i].bankrupt && !s.players[pIdx].bankrupt) s = payment(s, pIdx, card.payEach, i);
+      });
     }
     if (card.bail) {
       s = { ...s, players: s.players.map((p, i) => i === pIdx ? { ...p, bailCards: (p.bailCards || 0) + 1 } : p) };
@@ -823,7 +848,7 @@
     // setup
     init, rollDie, drawRandomCard,
     // запросы
-    isMonopoly, calcRent, houseCost, countHouses, countAirports, countUtils,
+    isMonopoly, calcRent, houseCost, countHouses, countHousesHotels, countAirports, countUtils,
     ownedInRegion, liquidWorth, groupHouseCounts,
     canBuild, canSellHouse, nextActiveIdx, tradeValueFor,
     getStyle, botWantsToBuy, propValueFor, partnerAcceptsTrade, botProposeTrade, botAuctionBid,
