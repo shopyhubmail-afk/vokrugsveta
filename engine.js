@@ -234,6 +234,10 @@
   };
 
   function getStyle(player) {
+    // выбранный в меню характер ботов перекрывает индивидуальный (только для ботов)
+    if (player.bot && window.VS_BOT_STYLE && STYLES[window.VS_BOT_STYLE]) {
+      return STYLES[window.VS_BOT_STYLE];
+    }
     return STYLES[player.id] || STYLES.balanced;
   }
 
@@ -395,9 +399,14 @@
     return s;
   }
 
-  // Возвращает true если игрок — человек ('you') и должен сам решать долговые проблемы
+  // Возвращает true если игрок — человек и должен сам решать долговые проблемы.
+  // Офлайн: только 'you'. Онлайн (state.manualDebt=true): любой не-бот,
+  // но только когда он текущий игрок (долги «между делом» — collectEach — авто).
   function needsManualDebt(state, pIdx) {
-    return state.players[pIdx] && state.players[pIdx].id === 'you';
+    const p = state.players[pIdx];
+    if (!p || p.bot) return false;
+    if (p.id === 'you') return true;
+    return !!state.manualDebt && pIdx === state.current;
   }
 
   // авто-залог/продажа домов для покрытия суммы need; возвращает state с максимальным балансом
