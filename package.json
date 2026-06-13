@@ -1,0 +1,12 @@
+{
+  "name": "vokrug-sveta",
+  "version": "1.0.0",
+  "description": "Вокруг света — монополия-путешествие (клиент + WS-сервер)",
+  "main": "server/server.js",
+  "scripts": {
+    "start": "node server/server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
